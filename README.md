@@ -74,12 +74,13 @@ Each path has a Browse button if the default isn't right.
 
 **3. Boot partition patches (A + B)** — checkboxes for the boot-side patches:
 - `Enable HDMI` — uncomment the display options in `config.txt`
-- `Disable SPI CAN overlays` — comment out `dtoverlay=spi*` / `dtoverlay=sc-mcp2518` lines (no SPI CAN hardware on Pi 5B)
+- `Disable carrier SPI CAN overlays` — comment out the CM5 carrier's `dtoverlay=spi*` / `dtoverlay=sc-mcp2518` lines
+- `Waveshare CAN FD HAT overlays` — append the `mcp251xfd` overlay block for the [Waveshare 2-CH CAN FD HAT](#waveshare-2-ch-can-fd-hat-can-fd)
 - `Add panic=0 + US wifi regdom` — append kernel cmdline params
 
 **4. Rootfs patches (A + B)** — checkboxes for the rootfs-side patches:
 - `Install flash-pico.sh` — install the script + service override that lets external Picos be flashed
-- `USB-CAN udev rule` — install `90-usb-can-rename.rules` (scoped to USB so vcan placeholders don't trigger restart loops)
+- `USB-CAN udev rule` — install `90-usb-can-rename.rules` (scoped to USB/SPI so vcan placeholders don't trigger restart loops)
 - `canbusprocess override (vcan placeholders)` — install the override that names USB-CAN adapters and fills any missing `can_s0..can_s4` slot with a vcan interface (HAL requires all 5)
 - `canbuswatchdog override` — install watchdog override that waits for any `can_s*` instead of requiring all 5
 - `robot.service override` — 30-second CAN wait then start regardless
@@ -114,7 +115,7 @@ Hover any checkbox for a tooltip explaining what that patch does.
 The script automates everything needed to convert the upstream CM5 image into a Pi 5B-compatible image:
 
 1. **Downloads** the upstream SystemCore Beta 10 image from GitHub (cached after first download)
-2. **Patches both boot partitions** (A/B) — enables HDMI, disables SPI CAN overlays, updates cmdline
+2. **Patches both boot partitions** (A/B) — enables HDMI, disables the carrier's SPI CAN overlays, adds the Waveshare CAN FD HAT overlays, updates cmdline
 3. **Patches both rootfs partitions** (A/B) — installs Pico flasher, CAN adapter support, dashboard patches
 
 ## What gets patched
@@ -125,7 +126,31 @@ The stock image disables all display output (headless for Limelight hardware). T
 
 ### SPI CAN overlays disabled
 
-The CM5 carrier board has 5 MCP2518FD SPI CAN controllers. The Pi 5B has none of this hardware, so the SPI CAN overlay lines are commented out.
+The CM5 carrier board has 5 MCP2518FD SPI CAN controllers wired through Limelight's `sc-mcp2518` overlays. The Pi 5B has none of that wiring, so those overlay lines are commented out.
+
+### Waveshare 2-CH CAN FD HAT (CAN FD)
+
+For real CAN FD, use the [Waveshare 2-CH CAN FD HAT](https://www.waveshare.com/wiki/2-CH_CAN_FD_HAT): two MCP2518FD controllers on the 40-pin header, using the mainline `mcp251xfd` driver. The image appends this block to `config.txt` on both boot partitions:
+
+```
+dtparam=spi=on
+dtoverlay=spi1-3cs
+dtoverlay=mcp251xfd,spi0-0,interrupt=25
+dtoverlay=mcp251xfd,spi1-0,interrupt=24
+```
+
+This matches the HAT's factory-default **dual-SPI "A" mode**: CAN_0 is on SPI0 CE0 with IRQ on GPIO25, and CAN_1 is on SPI1 CE0 with IRQ on GPIO24. The block is always on. Without the HAT, the driver probe just fails and no interface appears. GPIO 24/25 and the SPI0/SPI1 pins are claimed either way, so don't use them for anything else.
+
+**Hardware setup:**
+- Set the VIO jumper to **3.3V**. The Pi uses 3.3V logic.
+- Fit the 120Ω termination jumper only if the HAT sits at an end of the bus.
+- If you moved the 0R resistors to single-SPI **"B" mode**, edit `config.txt` on both boot partitions and change the last overlay line to `dtoverlay=mcp251xfd,spi0-1,interrupt=24`.
+
+**Naming and mode:**
+- CAN_0 → **`can_s0`** and CAN_1 → **`can_s1`**, always. They are matched by SPI device (`spi0.0`, then `spi1.0` or `spi0.1`), not by discovery order.
+- When the HAT is present, USB adapters are allocated from `can_s2` upward. Any old `/etc/can_port_map` entry that put a USB port on `can_s0`/`can_s1` is reassigned automatically.
+- HAT buses default to **CAN FD, 1 Mbps nominal / 2 Mbps data** (sample points 87.5% / 75%). That is the CTRE CANivore-standard timing. The MCP2518FD is a native ISO CAN FD controller and the driver enables transmitter delay compensation, so the gs_usb FD problems described below don't apply. To force classic CAN on a HAT channel, add `can_s0=classic` to `/etc/can_bus_mode`.
+- Check it: `ip -d link show can_s0` should show `<FD>`, `bitrate 1000000`, `dbitrate 2000000`, and `state ERROR-ACTIVE`. `dmesg | grep mcp251xfd` should show both controllers detected.
 
 ### Pico flasher (`flash-pico.sh`)
 
@@ -139,7 +164,7 @@ The build script replaces it with `flash-pico.sh` via a systemd override. This s
 
 ### Multi-adapter USB-CAN support (optional)
 
-The stock image expects 5 SPI CAN interfaces (`can_s0` through `can_s4`). The build script adds support for any number of USB-to-CAN adapters:
+The stock image expects 5 SPI CAN interfaces (`can_s0` through `can_s4`). The build script adds support for any number of USB-to-CAN adapters, alongside the CAN FD HAT if one is fitted:
 
 - **Udev rule** triggers the CAN service restart when an adapter is plugged in. The match is scoped to `SUBSYSTEMS=="usb"` so vcan placeholders (see below) don't re-trigger the service and cause an infinite restart loop.
 - **canbusprocess override** discovers all CAN interfaces, renames them to `can_s0`, `can_s1`, etc., and configures each as **classic CAN at 1Mbps by default** — the conservative choice that works with any device. CAN FD is opt-in per bus via `/etc/can_bus_mode`. **Do not raise the FD data bitrate to 5Mbps** — the bits are too short for the device transceivers to decode, ACKs never come back, the bus silently goes `ERROR-PASSIVE`, and Phoenix 6 TX appears stuck (TX packets counter frozen, TX dropped climbing).
@@ -157,13 +182,13 @@ Compatible with any SocketCAN-supported USB adapter (candleLight/canable, PEAK, 
 
 #### Overriding the bus mode per bus
 
-`/etc/can_bus_mode` is read at every `limelight_canbusprocess.service` start. Buses not listed default to **classic CAN at 1Mbps**. Format:
+`/etc/can_bus_mode` is read at every `limelight_canbusprocess.service` start. Unlisted USB buses default to **classic CAN at 1Mbps**. Unlisted Waveshare HAT buses default to **CAN FD at 1Mbps/2Mbps**. Format:
 
 ```
 can_sN=<classic|fd> [bitrate] [dbitrate]
 ```
 
-- `mode`: `classic` or `fd` (default `classic`)
+- `mode`: `classic` or `fd` (default `classic` for USB, `fd` for the HAT)
 - `bitrate`: nominal bitrate in bps (default `1000000`)
 - `dbitrate`: data-phase bitrate for FD only (default `2000000`, the CTRE CANivore standard)
 

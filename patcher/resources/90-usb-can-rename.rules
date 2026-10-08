@@ -1,5 +1,7 @@
-# Trigger CAN service restart when a USB-CAN adapter is plugged in.
-# SUBSYSTEMS=="usb" prevents the rule from matching vcan placeholders we
+# Trigger CAN service restart when a USB-CAN adapter is plugged in, or when
+# the Waveshare CAN FD HAT's MCP2518FD (SPI) interfaces register late.
+# SUBSYSTEMS=="usb"/"spi" prevents the rule from matching vcan placeholders we
 # create from within canbusprocess itself — otherwise the service restarts
 # in an infinite loop the moment it adds a vcan.
 SUBSYSTEM=="net", ACTION=="add", ATTR{type}=="280", SUBSYSTEMS=="usb", RUN+="/bin/systemctl restart limelight_canbusprocess.service"
+SUBSYSTEM=="net", ACTION=="add", ATTR{type}=="280", SUBSYSTEMS=="spi", RUN+="/bin/systemctl restart limelight_canbusprocess.service"

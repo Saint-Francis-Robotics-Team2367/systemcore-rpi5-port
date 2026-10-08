@@ -1,0 +1,11 @@
+# BEGIN waveshare-canfd-hat
+# Waveshare 2-CH CAN FD HAT (2x MCP2518FD, 40MHz), default dual-SPI "A" mode.
+# CAN_0 -> spi0.0 / GPIO25 IRQ, CAN_1 -> spi1.0 / GPIO24 IRQ.
+# For single-SPI "B" mode, change the last line to: spi0-1,interrupt=24
+# If no HAT is attached the driver probe fails harmlessly.
+[all]
+dtparam=spi=on
+dtoverlay=spi1-3cs
+dtoverlay=mcp251xfd,spi0-0,interrupt=25
+dtoverlay=mcp251xfd,spi1-0,interrupt=24
+# END waveshare-canfd-hat

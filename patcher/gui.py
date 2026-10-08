@@ -47,12 +47,13 @@ class PatcherGUI:
 
     BOOT_PATCHES = [
         ("enable_hdmi", "Enable HDMI"),
-        ("disable_spi_can", "Disable SPI CAN overlays"),
+        ("disable_spi_can", "Disable carrier SPI CAN overlays"),
+        ("enable_canfd_hat", "Waveshare CAN FD HAT overlays"),
         ("update_cmdline", "Add panic=0 + US wifi regdom"),
     ]
     ROOTFS_PATCHES = [
         ("install_flash_pico", "Install flash-pico.sh"),
-        ("install_can_udev", "USB-CAN udev rule"),
+        ("install_can_udev", "CAN hot-plug udev rule"),
         ("install_canbusprocess", "canbusprocess override (vcan placeholders)"),
         ("install_canbuswatchdog", "canbuswatchdog override"),
         ("install_robot_override", "robot.service override"),

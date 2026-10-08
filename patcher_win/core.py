@@ -38,6 +38,16 @@ RES_CANBUSWATCHDOG = RESOURCES / "canbuswatchdog-override.conf"
 RES_ROBOT = RESOURCES / "robot-override.conf"
 RES_PICOFLASHER = RESOURCES / "picoflasher-override.conf"
 RES_MRCCAN = RESOURCES / "mrccan.conf"
+RES_CANFD_HAT = RESOURCES / "canfd-hat-config.txt"
+
+# Waveshare 2-CH CAN FD HAT config.txt block (delimited by BEGIN/END markers
+# so re-patching replaces it instead of appending a second copy).
+CANFD_HAT_BEGIN = "# BEGIN waveshare-canfd-hat"
+CANFD_HAT_END = "# END waveshare-canfd-hat"
+CANFD_HAT_BLOCK_RE = re.compile(
+    rf"^{re.escape(CANFD_HAT_BEGIN)}$.*?^{re.escape(CANFD_HAT_END)}$\n?",
+    re.MULTILINE | re.DOTALL,
+)
 
 DEFAULT_FLASH_PICO = PROJECT_ROOT / "netboot" / "flash-pico.sh"
 DEFAULT_REGDB_DEB = (
@@ -73,6 +83,7 @@ class PatchOptions:
     # Boot patches
     enable_hdmi: bool = True
     disable_spi_can: bool = True
+    enable_canfd_hat: bool = True
     update_cmdline: bool = True
 
     # Rootfs patches
@@ -95,7 +106,7 @@ class PatchOptions:
 
     def patch_names(self) -> list[str]:
         return [
-            "enable_hdmi", "disable_spi_can", "update_cmdline",
+            "enable_hdmi", "disable_spi_can", "enable_canfd_hat", "update_cmdline",
             "install_flash_pico", "install_can_udev",
             "install_canbusprocess", "install_canbuswatchdog",
             "install_robot_override", "install_mrccan", "install_regdb",
@@ -105,10 +116,11 @@ class PatchOptions:
 
 PATCH_DESCRIPTIONS: dict[str, str] = {
     "enable_hdmi": "Uncomment HDMI display options in config.txt",
-    "disable_spi_can": "Comment out spi/sc-mcp2518 overlays (no SPI CAN on Pi 5B)",
+    "disable_spi_can": "Comment out the CM5 carrier's spi/sc-mcp2518 overlays",
+    "enable_canfd_hat": "Add mcp251xfd overlays for the Waveshare 2-CH CAN FD HAT",
     "update_cmdline": "Add panic=0 and cfg80211.ieee80211_regdom=US to cmdline.txt",
     "install_flash_pico": "Install flash-pico.sh + picoflasherprocess override",
-    "install_can_udev": "Install 90-usb-can-rename.rules (USB-only trigger)",
+    "install_can_udev": "Install 90-usb-can-rename.rules (USB/SPI CAN hot-plug trigger)",
     "install_canbusprocess": "Install canbusprocess override with vcan placeholders",
     "install_canbuswatchdog": "Install canbuswatchdog override (waits for any can_s*)",
     "install_robot_override": "Install robot.service override (30s CAN wait, optional)",
@@ -160,6 +172,18 @@ def patch_boot_partition(fat: FatPartition, opts: PatchOptions,
         config, _ = _sed(config, r"^(dtoverlay=spi[0-9].*)$", r"#\1", log)
         config, _ = _sed(config, r"^(dtoverlay=sc-mcp2518.*)$", r"#\1", log)
         fat.write_text("/config.txt", config)
+
+    if opts.enable_canfd_hat:
+        log.info("[%s] Adding Waveshare CAN FD HAT overlays", label)
+        for ovl in ("mcp251xfd", "spi1-3cs"):
+            if not fat.exists(f"/overlays/{ovl}.dtbo"):
+                log.warning("[%s] overlays/%s.dtbo missing — CAN FD HAT will "
+                            "not probe", label, ovl)
+        config = CANFD_HAT_BLOCK_RE.sub("", fat.read_text("/config.txt"))
+        if not config.endswith("\n"):
+            config += "\n"
+        fat.write_text("/config.txt",
+                       config + RES_CANFD_HAT.read_text(encoding="utf-8"))
 
     if opts.update_cmdline:
         try:
