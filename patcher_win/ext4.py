@@ -11,7 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 log = logging.getLogger("patcher")
@@ -130,7 +130,7 @@ class Ext4Partition:
         local_tmp.write_bytes(data)
 
         # Ensure parent directory exists
-        parent = str(Path(guest_path).parent).replace("\\", "/")
+        parent = str(PurePosixPath(guest_path.replace("\\", "/")).parent)
         if parent and parent != "/":
             self._mkdir_p(parent)
 
@@ -138,7 +138,9 @@ class Ext4Partition:
         self._run_debugfs([f"rm {guest_path}"], write=True)
         self._run_debugfs([
             f"write {local_tmp} {guest_path}",
-            f"set_inode_field {guest_path} mode 0{mode:o}",
+            # i_mode carries the file type too: S_IFREG (0o100000) | permissions.
+            # Bare permission bits leave the inode with "bad type".
+            f"set_inode_field {guest_path} mode 0{0o100000 | mode:o}",
         ], write=True)
 
         local_tmp.unlink()
@@ -155,12 +157,14 @@ class Ext4Partition:
 
     def _mkdir_p(self, guest_path: str) -> None:
         """Create directory and all parents (like mkdir -p)."""
-        parts = Path(guest_path).parts
+        # PurePosixPath: guest paths are always POSIX, even on Windows. Never
+        # issue `mkdir /` or `//x` — debugfs turns those into a zero-length
+        # directory entry in /, which corrupts the filesystem.
+        parts = PurePosixPath(guest_path.replace("\\", "/")).parts[1:]
         for i in range(1, len(parts) + 1):
-            partial = "/".join(parts[:i])
-            if not partial.startswith("/"):
-                partial = "/" + partial
-            # debugfs mkdir on existing dir is a no-op warning, not fatal
+            partial = "/" + "/".join(parts[:i])
+            if self.exists(partial):
+                continue
             self._run_debugfs([f"mkdir {partial}"], write=True)
         self._modified = True
 

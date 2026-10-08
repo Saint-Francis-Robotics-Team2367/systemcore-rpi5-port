@@ -22,6 +22,7 @@ from .partition import ImageLayout, Partition, detect_layout
 from .fat import FatPartition
 from .ext4 import Ext4Partition, _find_debugfs
 from .deb import extract_deb_data
+from patcher import dashboard
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +40,20 @@ RES_ROBOT = RESOURCES / "robot-override.conf"
 RES_PICOFLASHER = RESOURCES / "picoflasher-override.conf"
 RES_MRCCAN = RESOURCES / "mrccan.conf"
 RES_CANFD_HAT = RESOURCES / "canfd-hat-config.txt"
+RES_STOCK_CAN_NAMES = RESOURCES / "70-can-interface-names.rules"
+
+# Beta 15+ ships robot_heartbeat.ko, which creates /dev/mrccan/* itself. The
+# Beta 10 tmpfiles.d workaround must NOT be installed alongside it.
+HEARTBEAT_MODULE_DIR = "/lib/modules"
+HEARTBEAT_MODULE_REL = "kernel/net/can"
 
 # Waveshare 2-CH CAN FD HAT config.txt block (delimited by BEGIN/END markers
 # so re-patching replaces it instead of appending a second copy).
 CANFD_HAT_BEGIN = "# BEGIN waveshare-canfd-hat"
 CANFD_HAT_END = "# END waveshare-canfd-hat"
+# Beta 15 routes I2C1 onto GPIO10/11 — the SPI0 MOSI/SCLK pins the CAN FD
+# HAT's CAN_0 uses. Comment it out whenever the HAT block is installed.
+I2C1_ON_SPI0_RE = r"^(dtoverlay=i2c1,pins_10_11.*)$"
 CANFD_HAT_BLOCK_RE = re.compile(
     rf"^{re.escape(CANFD_HAT_BEGIN)}$.*?^{re.escape(CANFD_HAT_END)}$\n?",
     re.MULTILINE | re.DOTALL,
@@ -120,11 +130,11 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "enable_canfd_hat": "Add mcp251xfd overlays for the Waveshare 2-CH CAN FD HAT",
     "update_cmdline": "Add panic=0 and cfg80211.ieee80211_regdom=US to cmdline.txt",
     "install_flash_pico": "Install flash-pico.sh + picoflasherprocess override",
-    "install_can_udev": "Install 90-usb-can-rename.rules (USB/SPI CAN hot-plug trigger)",
+    "install_can_udev": "Install CAN hot-plug udev rule; disable stock carrier CAN naming",
     "install_canbusprocess": "Install canbusprocess override with vcan placeholders",
     "install_canbuswatchdog": "Install canbuswatchdog override (waits for any can_s*)",
     "install_robot_override": "Install robot.service override (30s CAN wait, optional)",
-    "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (unblocks MrcCommDaemon)",
+    "install_mrccan": "Pre-Beta 15 only: /etc/tmpfiles.d/mrccan.conf (skipped if robot_heartbeat.ko exists)",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -179,7 +189,8 @@ def patch_boot_partition(fat: FatPartition, opts: PatchOptions,
             if not fat.exists(f"/overlays/{ovl}.dtbo"):
                 log.warning("[%s] overlays/%s.dtbo missing — CAN FD HAT will "
                             "not probe", label, ovl)
-        config = CANFD_HAT_BLOCK_RE.sub("", fat.read_text("/config.txt"))
+        config, _ = _sed(fat.read_text("/config.txt"), I2C1_ON_SPI0_RE, r"#\1", log)
+        config = CANFD_HAT_BLOCK_RE.sub("", config)
         if not config.endswith("\n"):
             config += "\n"
         fat.write_text("/config.txt",
@@ -231,6 +242,9 @@ def patch_rootfs_partition(ext4: Ext4Partition, opts: PatchOptions,
         log.info("[%s] Installing CAN udev rules", label)
         if not opts.dry_run:
             ext4.copy_file_in(RES_UDEV_CAN, "/etc/udev/rules.d/90-usb-can-rename.rules")
+            # Same filename as the stock rule so it replaces it.
+            ext4.copy_file_in(RES_STOCK_CAN_NAMES,
+                              "/etc/udev/rules.d/70-can-interface-names.rules")
 
     if opts.install_canbusprocess:
         log.info("[%s] Installing canbusprocess override", label)
@@ -257,9 +271,13 @@ def patch_rootfs_partition(ext4: Ext4Partition, opts: PatchOptions,
             )
 
     if opts.install_mrccan:
-        log.info("[%s] Installing mrccan tmpfiles.d config", label)
-        if not opts.dry_run:
-            ext4.copy_file_in(RES_MRCCAN, "/etc/tmpfiles.d/mrccan.conf")
+        if _has_heartbeat_module(ext4):
+            log.info("[%s] robot_heartbeat.ko present — not installing mrccan tmpfile",
+                     label)
+        else:
+            log.info("[%s] Installing mrccan tmpfiles.d config", label)
+            if not opts.dry_run:
+                ext4.copy_file_in(RES_MRCCAN, "/etc/tmpfiles.d/mrccan.conf")
 
     if opts.install_regdb:
         if not opts.regdb_deb_path.exists():
@@ -272,6 +290,15 @@ def patch_rootfs_partition(ext4: Ext4Partition, opts: PatchOptions,
 
     if opts.patch_dashboard_wlan or opts.patch_dashboard_faults:
         _patch_dashboard(ext4, opts, log, label)
+
+
+def _has_heartbeat_module(ext4: Ext4Partition) -> bool:
+    out = ext4._run_debugfs([f"ls {HEARTBEAT_MODULE_DIR}"])
+    for kver in re.findall(r"\(\d+\)\s+([0-9][^\s]*)", out):
+        listing = ext4._run_debugfs([f"ls {HEARTBEAT_MODULE_DIR}/{kver}/{HEARTBEAT_MODULE_REL}"])
+        if "robot_heartbeat.ko" in listing:
+            return True
+    return False
 
 
 def _install_regdb(ext4: Ext4Partition, deb: Path, log: logging.Logger, label: str) -> None:
@@ -310,37 +337,8 @@ def _patch_dashboard(ext4: Ext4Partition, opts: PatchOptions,
         return
 
     content = ext4.read_text(js_path)
-
-    if opts.patch_dashboard_wlan:
-        content, _ = _sed(content, r"disabled:o\|\|a", "disabled:o", log)
-        content, _ = _sed(
-            content,
-            r',\{static_ip:"172\.30\.0\.1",gateway:"172\.30\.0\.1",use_dhcp:!1\}',
-            ",{}",
-            log,
-        )
-
-    if opts.patch_dashboard_faults:
-        content, _ = _sed(
-            content,
-            r"faultCounts:t\.fc\|\|\[0,0,0,0,0,0\]",
-            "faultCounts:(window.__rawFC=t.fc||[0,0,0,0,0,0]).map(function(v,j){"
-            "return Math.max(0,v-((window.__faultBL||[])[j]||0))})",
-            log,
-        )
-        content, _ = _sed(
-            content,
-            r'"historical-"\.concat\(t\)\)\}\)\)\]',
-            '"historical-".concat(t))})),'
-            '(0,xo.jsx)("div",{style:{marginTop:"8px",textAlign:"center"},'
-            'children:(0,xo.jsx)("button",{onClick:function(){'
-            'window.__faultBL=window.__rawFC?window.__rawFC.slice():[]},'
-            'style:{fontSize:"11px",padding:"2px 8px",cursor:"pointer",'
-            'background:"#333",color:"#fff",border:"1px solid #666",'
-            'borderRadius:"3px"},children:"Reset Fault Counts"})})]',
-            log,
-        )
-
+    content = dashboard.patch(content, log, wlan=opts.patch_dashboard_wlan,
+                              faults=opts.patch_dashboard_faults)
     ext4.write_text(js_path, content)
 
 
@@ -359,12 +357,13 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
             continue
         with Ext4Partition(layout.image, part.start_bytes, part.size_bytes) as ext4:
             expected = [
-                "/etc/tmpfiles.d/mrccan.conf",
                 "/etc/udev/rules.d/90-usb-can-rename.rules",
                 "/etc/systemd/system/limelight_canbusprocess.service.d/override.conf",
                 "/etc/systemd/system/robot.service.d/override.conf",
                 "/usr/local/bin/flash-pico.sh",
             ]
+            if not _has_heartbeat_module(ext4):
+                expected.append("/etc/tmpfiles.d/mrccan.conf")
             for rel in expected:
                 if not ext4.exists(rel):
                     problems.append(f"[{label}] missing: {rel}")

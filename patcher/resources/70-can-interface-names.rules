@@ -1,0 +1,5 @@
+# Replaces the stock SystemCore rule that names the carrier board's SPI CAN
+# controllers (spi2.0/spi2.1/spi3.0/spi1.0/spi1.1 -> can_s0..can_s4). On a
+# Pi 5B those controllers don't exist, and its spi1.0 -> can_s3 entry would
+# grab the Waveshare CAN FD HAT's CAN_1. limelight_canbusprocess does all
+# can_sN naming instead.

@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
+from . import dashboard
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -41,11 +43,21 @@ RES_ROBOT = RESOURCES / "robot-override.conf"
 RES_PICOFLASHER = RESOURCES / "picoflasher-override.conf"
 RES_MRCCAN = RESOURCES / "mrccan.conf"
 RES_CANFD_HAT = RESOURCES / "canfd-hat-config.txt"
+RES_STOCK_CAN_NAMES = RESOURCES / "70-can-interface-names.rules"
+
+# Beta 15+ ships robot_heartbeat.ko, which creates /dev/mrccan/* itself. The
+# Beta 10 tmpfiles.d workaround must NOT be installed alongside it (a
+# pre-created /dev/mrccan dir lets MrcCommDaemon create plain files there,
+# which block the module's device nodes).
+HEARTBEAT_MODULE_GLOB = "lib/modules/*/kernel/net/can/robot_heartbeat.ko*"
 
 # Waveshare 2-CH CAN FD HAT config.txt block (delimited by BEGIN/END markers
 # so re-patching replaces it instead of appending a second copy).
 CANFD_HAT_BEGIN = "# BEGIN waveshare-canfd-hat"
 CANFD_HAT_END = "# END waveshare-canfd-hat"
+# Beta 15 routes I2C1 onto GPIO10/11 — the SPI0 MOSI/SCLK pins the CAN FD
+# HAT's CAN_0 uses. Comment it out whenever the HAT block is installed.
+I2C1_ON_SPI0_RE = r"^(dtoverlay=i2c1,pins_10_11.*)$"
 CANFD_HAT_BLOCK_RE = re.compile(
     rf"^{re.escape(CANFD_HAT_BEGIN)}$.*?^{re.escape(CANFD_HAT_END)}$\n?",
     re.MULTILINE | re.DOTALL,
@@ -142,11 +154,11 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "enable_canfd_hat": "Add mcp251xfd overlays for the Waveshare 2-CH CAN FD HAT",
     "update_cmdline": "Add panic=0 and cfg80211.ieee80211_regdom=US to cmdline.txt",
     "install_flash_pico": "Install flash-pico.sh + picoflasherprocess override",
-    "install_can_udev": "Install 90-usb-can-rename.rules (USB/SPI CAN hot-plug trigger)",
+    "install_can_udev": "Install CAN hot-plug udev rule; disable stock carrier CAN naming",
     "install_canbusprocess": "Install canbusprocess override with vcan placeholders",
     "install_canbuswatchdog": "Install canbuswatchdog override (waits for any can_s*)",
     "install_robot_override": "Install robot.service override (30s CAN wait, optional)",
-    "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (unblocks MrcCommDaemon)",
+    "install_mrccan": "Pre-Beta 15 only: /etc/tmpfiles.d/mrccan.conf (skipped if robot_heartbeat.ko exists)",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -456,6 +468,7 @@ def patch_boot_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
             if not (mount / "overlays" / f"{ovl}.dtbo").exists():
                 log.warning("[%s] overlays/%s.dtbo missing — CAN FD HAT will "
                             "not probe", label, ovl)
+        sed_inplace(config, I2C1_ON_SPI0_RE, r"#\1", log, opts.dry_run)
         if not opts.dry_run:
             text = CANFD_HAT_BLOCK_RE.sub("", config.read_text(encoding="utf-8"))
             if not text.endswith("\n"):
@@ -502,6 +515,11 @@ def patch_rootfs_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
     if opts.install_can_udev:
         copy_into(RES_UDEV_CAN, mount / "etc/udev/rules.d/90-usb-can-rename.rules",
                   log, opts.dry_run)
+        # Same filename as the stock rule so it replaces it (spi1.0 -> can_s3
+        # would otherwise grab the CAN FD HAT's CAN_1).
+        copy_into(RES_STOCK_CAN_NAMES,
+                  mount / "etc/udev/rules.d/70-can-interface-names.rules",
+                  log, opts.dry_run)
 
     if opts.install_canbusprocess:
         copy_into(
@@ -525,7 +543,14 @@ def patch_rootfs_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
         )
 
     if opts.install_mrccan:
-        copy_into(RES_MRCCAN, mount / "etc/tmpfiles.d/mrccan.conf", log, opts.dry_run)
+        tmpfile = mount / "etc/tmpfiles.d/mrccan.conf"
+        if list(mount.glob(HEARTBEAT_MODULE_GLOB)):
+            log.info("[%s] robot_heartbeat.ko present — not installing mrccan tmpfile",
+                     label)
+            if tmpfile.exists() and not opts.dry_run:
+                tmpfile.unlink()
+        else:
+            copy_into(RES_MRCCAN, tmpfile, log, opts.dry_run)
 
     if opts.install_regdb:
         if not opts.regdb_deb_path.exists():
@@ -562,41 +587,12 @@ def _patch_dashboard(mount: Path, opts: PatchOptions, log: logging.Logger,
         return
     js = js_files[0]
     log.info("[%s] Patching dashboard at %s", label, js.name)
-
-    if opts.patch_dashboard_wlan:
-        sed_inplace(js, r"disabled:o\|\|a", "disabled:o", log, opts.dry_run)
-        sed_inplace(
-            js,
-            r',\{static_ip:"172\.30\.0\.1",gateway:"172\.30\.0\.1",use_dhcp:!1\}',
-            ",{}",
-            log,
-            opts.dry_run,
-        )
-
-    if opts.patch_dashboard_faults:
-        # Frontend-only baseline offset for fault counts.
-        sed_inplace(
-            js,
-            r"faultCounts:t\.fc\|\|\[0,0,0,0,0,0\]",
-            "faultCounts:(window.__rawFC=t.fc||[0,0,0,0,0,0]).map(function(v,j){"
-            "return Math.max(0,v-((window.__faultBL||[])[j]||0))})",
-            log,
-            opts.dry_run,
-        )
-        # Inject the reset button next to the historical fault list.
-        sed_inplace(
-            js,
-            r'"historical-"\.concat\(t\)\)\}\)\)\]',
-            '"historical-".concat(t))})),'
-            '(0,xo.jsx)("div",{style:{marginTop:"8px",textAlign:"center"},'
-            'children:(0,xo.jsx)("button",{onClick:function(){'
-            'window.__faultBL=window.__rawFC?window.__rawFC.slice():[]},'
-            'style:{fontSize:"11px",padding:"2px 8px",cursor:"pointer",'
-            'background:"#333",color:"#fff",border:"1px solid #666",'
-            'borderRadius:"3px"},children:"Reset Fault Counts"})})]',
-            log,
-            opts.dry_run,
-        )
+    if opts.dry_run:
+        return
+    text = js.read_text(encoding="utf-8")
+    js.write_text(dashboard.patch(text, log, wlan=opts.patch_dashboard_wlan,
+                                  faults=opts.patch_dashboard_faults),
+                  encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -626,12 +622,13 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
                 continue
             with mount_partition(layout.image, part, log, tracker) as mnt:
                 expected = [
-                    "etc/tmpfiles.d/mrccan.conf",
                     "etc/udev/rules.d/90-usb-can-rename.rules",
                     "etc/systemd/system/limelight_canbusprocess.service.d/override.conf",
                     "etc/systemd/system/robot.service.d/override.conf",
                     "usr/local/bin/flash-pico.sh",
                 ]
+                if not list(mnt.glob(HEARTBEAT_MODULE_GLOB)):
+                    expected.append("etc/tmpfiles.d/mrccan.conf")
                 for rel in expected:
                     p = mnt / rel
                     if not p.exists():
